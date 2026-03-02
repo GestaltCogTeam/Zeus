@@ -4,7 +4,7 @@ from torch import nn
 import numpy as np
 import math
 from typing import List, Optional
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, AutoConfig
 from .configuration_zeus import ZeusConfig
 from basicts.modules import ACT2FN
 from basicts.modules.transformer import DecoderOnlyLayer, MultiHeadAttention, RotaryPositionEmbedding, AutoRegressiveDecoder
@@ -46,10 +46,10 @@ class ZeusFlashAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,                # [B, L, C]
+        hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[object] = None,     # 接口保留
+        past_key_value: Optional[object] = None,
         use_cache: bool = False,
         output_attentions: bool = False,
         layer_idx: Optional[int] = None,
@@ -136,7 +136,7 @@ class EncoderLayer(DecoderOnlyLayer):
     def __init__(self, config: ZeusConfig, stage: int):
         
         attn_cls = ZeusFlashAttention \
-            if config.attn_implementation == "flash_attention_2" else MultiHeadAttention
+            if config._attn_implementation == "flash_attention_2" else MultiHeadAttention
         
         self_attn = attn_cls(
             hidden_size=config.hidden_size[stage],
@@ -258,6 +258,7 @@ class ZeusProjUnpoolingLayer(nn.Module):
 
 class ZeusPreTrainedModel(PreTrainedModel):
     config_class = ZeusConfig
+    _supports_flash_attn_2 = True
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -310,8 +311,7 @@ class Zeus(ZeusPreTrainedModel):
         quantiles = torch.tensor(config.quantiles)
         self.register_buffer("quantiles", quantiles, persistent=False)
         self.head = nn.Linear(config.hidden_size[-1], self.num_quantiles)
-        
-        # 初始化权重
+
         self.post_init()
 
     def _prepare_embedding(
@@ -425,24 +425,9 @@ class Zeus(ZeusPreTrainedModel):
         target_mask: [B, L, 1] (1 for target/predict, 0 for context)
         """
 
-        is_multiview = inputs.ndim == 4
-        orig_batch_size = inputs.shape[0]
-        
-        if is_multiview:
-            B, V, L, _ = inputs.shape
-            inputs = inputs.reshape(B * V, L, 1)
-            if targets is not None:
-                targets = targets.reshape(B * V, L, 1)
-            if targets_mask is not None:
-                targets_mask = targets_mask.reshape(B * V, L, 1)
-            if padding_mask is not None:
-                padding_mask = padding_mask.reshape(B * V, L, 1)
-
-        # --- Step 1: Embedding ---
         ori_seq_len = inputs.shape[1]
         ori_padding_mask = padding_mask
         hidden_states, padding_mask = self._prepare_embedding(inputs, targets_mask, padding_mask)
-        B = hidden_states.shape[0]
 
         scale_outputs = []
         scale_padding_masks = []
@@ -484,10 +469,7 @@ class Zeus(ZeusPreTrainedModel):
 
             if i < self.num_scales:
                 scale_outputs.append(hidden_states)
-
-        # hidden_states = self.layer_norm(hidden_states)
         
-        # --- Step 3: Prediction Head ---
         # [B, L, D] -> [B, L, Q]
         # print(hidden_states)
         quantile_preds = self.head(hidden_states)[:, :ori_seq_len, :]
@@ -508,7 +490,13 @@ class Zeus(ZeusPreTrainedModel):
             "all_hidden_states": all_hidden_states,
             "reg_token_emb": reg_token_emb,
         }
-    
+
+
+class ZeusForPrediction(Zeus):
+
+    def __init__(self, config: ZeusConfig):
+        super().__init__(config)
+
     def generate(self, context: torch.Tensor, prediction_length: int, normalize: bool = True):
 
         ndim = context.ndim
@@ -560,7 +548,7 @@ class Zeus(ZeusPreTrainedModel):
 
         return prediction
 
-    def predict(self, context, prediction_length, normalize: bool = True, max_pred_len=4096):
+    def predict(self, context, prediction_length, use_norm: bool = True, max_pred_len=4096):
         """
         arrays: list of np.ndarray, each [L] or [L, N]
         F: forecast length
@@ -626,7 +614,7 @@ class Zeus(ZeusPreTrainedModel):
             | (tgt_masks.astype(bool))
         ).astype(np.int32)
 
-        if normalize:
+        if use_norm:
             mean = np.nanmean(batch, axis=1, keepdims=True)
             std = np.nanstd(batch, axis=1, keepdims=True)
             mean[np.isnan(mean)] = 0.0
@@ -652,7 +640,7 @@ class Zeus(ZeusPreTrainedModel):
             )
         
         quantile_preds = outputs["prediction"].float().detach().cpu().numpy()  # [B*N, T, Q]
-        if normalize:
+        if use_norm:
             quantile_preds = np.sinh(quantile_preds) * std + mean
         quantile_preds = quantile_preds[tgt_masks.repeat(self.num_quantiles, axis=2)].reshape(B, N, prediction_length, self.num_quantiles)
 
