@@ -1,10 +1,9 @@
-import torch
-import torch.nn.functional as F
-from torch import nn
 import numpy as np
+import torch
+from torch import nn
 import math
-from typing import List, Optional
-from transformers import PreTrainedModel, AutoConfig
+from typing import Tuple, Optional
+from transformers import PreTrainedModel
 from .configuration_zeus import ZeusConfig
 from basicts.modules import ACT2FN
 from basicts.modules.transformer import DecoderOnlyLayer, MultiHeadAttention, RotaryPositionEmbedding, AutoRegressiveDecoder
@@ -65,7 +64,7 @@ class ZeusFlashAttention(nn.Module):
         v = self._shape(self.v_proj(hidden_states), B, L)
 
         if attention_mask is None:
-            attention_mask = torch.ones((B, L), device=device, dtype=torch.bool)
+            mask = torch.ones((B, L), device=device, dtype=torch.bool)
 
         q_unpad, indices, cu_seqlens, max_seqlen, _ = unpad_input(q, attention_mask)
         k_unpad, _, _, _, _ = unpad_input(k, attention_mask)
@@ -136,7 +135,7 @@ class EncoderLayer(DecoderOnlyLayer):
     def __init__(self, config: ZeusConfig, stage: int):
         
         attn_cls = ZeusFlashAttention \
-            if config._attn_implementation == "flash_attention_2" else MultiHeadAttention
+            if config.attn_implementation == "flash_attention_2" else MultiHeadAttention
         
         self_attn = attn_cls(
             hidden_size=config.hidden_size[stage],
@@ -216,7 +215,7 @@ class ZeusEncoder(AutoRegressiveDecoder):
         
         return hidden_states, attn_weights, kv_cache, reg_tokens
 
-class ZeusProjPoolingLayer(nn.Module):
+class ZeusPoolingLayer(nn.Module):
 
     def __init__(self, config: ZeusConfig, stage: int):
         super().__init__()
@@ -236,7 +235,7 @@ class ZeusProjPoolingLayer(nn.Module):
         padding_mask = padding_mask.reshape(batch_size, -1, self.factor, 1).any(dim=2)
         return hidden_states, padding_mask
 
-class ZeusProjUnpoolingLayer(nn.Module):
+class ZeusUnpoolingLayer(nn.Module):
 
     def __init__(self, config: ZeusConfig, stage: int):
         super().__init__()
@@ -258,7 +257,6 @@ class ZeusProjUnpoolingLayer(nn.Module):
 
 class ZeusPreTrainedModel(PreTrainedModel):
     config_class = ZeusConfig
-    _supports_flash_attn_2 = True
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -273,6 +271,8 @@ class ZeusPreTrainedModel(PreTrainedModel):
 
 
 class Zeus(ZeusPreTrainedModel):
+
+    _supports_flash_attn_2 = True
     
     def __init__(self, config: ZeusConfig):
         super().__init__(config)
@@ -280,13 +280,13 @@ class Zeus(ZeusPreTrainedModel):
         self.scales = config.scales
         self.num_reg_tokens = config.num_reg_tokens
         self.num_scales = len(self.scales)
-        
+
         self.input_mlp = ZeusInputEmbedding(
             config.input_dim,
             config.hidden_size[0],
             config.hidden_act
             )
-        
+
         self.special_tokens = nn.Embedding(2, config.hidden_size[0])
         self.pad_token_id = 0
         self.mask_token_id = 1
@@ -295,17 +295,17 @@ class Zeus(ZeusPreTrainedModel):
         self.downsamplers = nn.ModuleList()
         self.upsamplers = nn.ModuleList()
 
+        # first layer
         self.encoders.append(ZeusEncoder(config, 0))
-        
+
         # down samplers
         for i in range(1, self.num_scales // 2 + 1):
             self.encoders.append(ZeusEncoder(config, i))
-            self.downsamplers.append(ZeusProjPoolingLayer(config, i))
+            self.downsamplers.append(ZeusPoolingLayer(config, i))
         
         for i in range(self.num_scales // 2 + 1, self.num_scales):
             self.encoders.append(ZeusEncoder(config, i))
-            self.upsamplers.append(ZeusProjUnpoolingLayer(config, i))
-
+            self.upsamplers.append(ZeusUnpoolingLayer(config, i))
 
         self.num_quantiles = len(config.quantiles)
         quantiles = torch.tensor(config.quantiles)
@@ -355,10 +355,6 @@ class Zeus(ZeusPreTrainedModel):
                     device=input_embeds.device
                 )
             )
-            # pad_tokens = torch.zeros(
-            #     (B, pad_len, input_embeds.shape[-1]),
-            #     device=input_embeds.device,
-            #     dtype=input_embeds.dtype)
             
             input_embeds = torch.cat(
                 [input_embeds, pad_tokens],dim=1)
@@ -425,6 +421,7 @@ class Zeus(ZeusPreTrainedModel):
         target_mask: [B, L, 1] (1 for target/predict, 0 for context)
         """
 
+        # embedding
         ori_seq_len = inputs.shape[1]
         ori_padding_mask = padding_mask
         hidden_states, padding_mask = self._prepare_embedding(inputs, targets_mask, padding_mask)
@@ -459,19 +456,13 @@ class Zeus(ZeusPreTrainedModel):
             if i == self.num_scales - 2:
                 reg_token_emb = reg_tokens.mean(dim=1) 
             
-            # if self.num_reg_tokens > 0 and i >= self.num_scales // 2:
-            #     reg_token_list.append(reg_tokens) # [B, num_reg_tokens, D]
-
-            # print(i, torch.abs(hidden_states).mean())
-            
             if return_all_hidden_states:
                 all_hidden_states.append(hidden_states)
 
             if i < self.num_scales:
                 scale_outputs.append(hidden_states)
-        
+
         # [B, L, D] -> [B, L, Q]
-        # print(hidden_states)
         quantile_preds = self.head(hidden_states)[:, :ori_seq_len, :]
 
         loss = 0.0
@@ -497,8 +488,16 @@ class ZeusForPrediction(Zeus):
     def __init__(self, config: ZeusConfig):
         super().__init__(config)
 
-    def generate(self, context: torch.Tensor, prediction_length: int, normalize: bool = True):
+    def generate(
+            self,
+            context: torch.Tensor,
+            prediction_length: int,
+            context_mask: torch.Tensor = None,
+            use_norm: bool = True
+            ) -> Tuple[torch.Tensor, torch.Tensor]:
 
+        context = context.to(self.device)
+        
         ndim = context.ndim
         num_features = None
         if ndim == 2:
@@ -512,7 +511,7 @@ class ZeusForPrediction(Zeus):
         B, L, _ = context.shape
         device = context.device
 
-        if normalize:
+        if use_norm:
             mean = context.mean(dim=1, keepdim=True)
             std = context.std(dim=1, keepdim=True)
             context = (context - mean) / std
@@ -520,7 +519,14 @@ class ZeusForPrediction(Zeus):
         
         inputs = torch.cat(
             [context, torch.zeros(B, prediction_length, 1, device=device)], dim=1)
-        padding_mask = torch.ones(B, L+prediction_length, 1, device=device, dtype=torch.int32)
+        if context_mask is None:
+            context_mask = torch.torch.ones(B, L, 1, device=device, dtype=torch.int32)
+        padding_mask = torch.cat(
+            [
+                context_mask,
+                torch.ones(B, prediction_length, 1, dtype=torch.int32, device=device)
+            ], dim=1
+        )
         targets_mask = torch.cat(
             [
                 torch.zeros_like(context, dtype=torch.int32),
@@ -534,31 +540,39 @@ class ZeusForPrediction(Zeus):
                 padding_mask=padding_mask,
                 targets_mask=targets_mask,
             )
-        
+
+        # [B, L, Q]
         quantile_preds = outputs["prediction"][:, -prediction_length:, :]
+
+        if use_norm:
+            quantile_preds = torch.sinh(quantile_preds)
+            quantile_preds = quantile_preds * std + mean
+
         # [B, L, 1]
         prediction = quantile_preds.mean(dim=-1, keepdim=True)
 
-        if normalize:
-            prediction = torch.sinh(prediction)
-            prediction = prediction * std + mean
+        if ndim == 2: # [B, L]
+            prediction = prediction.squeeze(-1)
+        elif ndim == 3 and num_features is not None:
+            # [B, L, N]
+            prediction = prediction.reshape(-1, num_features, prediction_length).transpose(1, 2)
+            prediction = quantile_preds.reshape(
+                -1, num_features, prediction_length, quantile_preds.shape[-1]
+                ).transpose(1, 2) # [B, L, N, Q]
+        elif ndim == 1:
+            prediction = prediction[0, :, 0] #[L,]
+            quantile_preds = quantile_preds[0] # [L, Q]
 
-        if ndim == 3 and context.shape[2] > 1:
-            context = context.view(B, num_features, L).transpose(1, 2)
+        return prediction, quantile_preds
+    
+    def predict(
+            self,
+            context,
+            prediction_length,
+            use_norm: bool = True,
+            max_pred_len: int = 4096
+            ):
 
-        return prediction
-
-    def predict(self, context, prediction_length, use_norm: bool = True, max_pred_len=4096):
-        """
-        arrays: list of np.ndarray, each [L] or [L, N]
-        F: forecast length
-        """
-
-        # if prediction_length < 100:
-        #     max_pred_len = 1024
-        # else:
-        #     max_pred_len = 2880
-        
         B = len(context)
 
         series = []
@@ -653,11 +667,16 @@ class ZeusForPrediction(Zeus):
         return preds, quantile_preds
 
 
-class ZeusForReconstruction(Zeus):
+class ZeusForImputation(Zeus):
     def __init__(self, config: ZeusConfig):
         super().__init__(config)
     
-    def generate(self, inputs: torch.Tensor, targets_mask: torch.Tensor, use_norm: bool = True):
+    def generate(
+            self,
+            inputs: torch.Tensor,
+            targets_mask: torch.Tensor,
+            use_norm: bool = True
+            ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         # transform inputs and targets_mask to [B * N, L, 1]
         ndim = inputs.ndim
@@ -702,33 +721,6 @@ class ZeusForReconstruction(Zeus):
 class ZeusForClassification(Zeus):
     def __init__(self, config: ZeusConfig):
         super().__init__(config)
-    
-    def generate(
-            self,
-            inputs: torch.Tensor,
-            prototypes: List[torch.Tensor],
-            use_norm: bool = True
-            ):
-
-        # [B, 1, D]
-        input_features = self.generate_one_sample(inputs, use_norm=use_norm).unsqueeze(1)
-
-        sims = []
-        for prototype in prototypes:
-            # [1, B_p, D]
-            prototype_features = self.generate_one_sample(prototype, use_norm=use_norm).unsqueeze(0)
-            # [B, 1]
-            sim = F.cosine_similarity(
-                input_features, prototype_features, dim=2).mean(dim=1, keepdim=True)
-            sims.append(sim)
-        
-        # [B, num_classes]
-        logits = torch.cat(sims, dim=1)
-        # [B, num_classes]
-        probs = F.softmax(logits, dim=1)
-        # [B]
-        preds = torch.argmax(probs, dim=1)
-        return preds, probs
     
     def generate_one_sample(self, inputs: torch.Tensor, padding_mask: torch.Tensor = None, use_norm: bool = True):
         # transform inputs and targets_mask to [B * N, L, 1]

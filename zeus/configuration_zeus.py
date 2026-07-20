@@ -22,6 +22,16 @@ class ZeusConfig(PretrainedConfig):
         num_latent_tokens: int = 2,
         attn_implementation: str = "eager",
         use_latent_tokens: bool = True,
+        use_pcl: bool = True,
+        contrastive_size: int = 768,
+        contrastive_loss_weight: float = 1.0,
+        num_prototypes: int = 16384,
+        student_temp: float = 0.1,
+        teacher_temp: float = 0.05,
+        temperature: float = 0.1,
+        center_momentum: float = 0.9,
+        sinkhorn_iters: int = 3,
+        sinkhorn_eps: float = 0.05,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -40,3 +50,14 @@ class ZeusConfig(PretrainedConfig):
         self.attn_implementation = attn_implementation
         self.dtype = torch.bfloat16
         self.use_latent_tokens = use_latent_tokens
+
+        self.use_pcl= use_pcl
+        self.contrastive_size = contrastive_size
+        self.contrastive_loss_weight = contrastive_loss_weight
+        self.num_prototypes = num_prototypes
+        self.student_temp = student_temp
+        self.teacher_temp = teacher_temp
+        self.temperature = temperature
+        self.sinkhorn_iters = sinkhorn_iters
+        self.sinkhorn_eps = sinkhorn_eps
+        self.center_momentum = center_momentum
