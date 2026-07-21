@@ -8,8 +8,14 @@ from .configuration_zeus import ZeusConfig
 from basicts.modules import ACT2FN
 from basicts.modules.transformer import DecoderOnlyLayer, MultiHeadAttention, RotaryPositionEmbedding, AutoRegressiveDecoder
 from basicts.modules.norm import RMSNorm
-from flash_attn import flash_attn_varlen_func
-from flash_attn.bert_padding import unpad_input, pad_input
+
+# FlashAttention v2
+# https://github.com/Dao-AILab/flash-attention
+try:
+    from flash_attn import flash_attn_varlen_func
+    from flash_attn.bert_padding import unpad_input, pad_input
+except ImportError:
+    pass
 
 
 class ZeusFlashAttention(nn.Module):
@@ -273,7 +279,7 @@ class ZeusPreTrainedModel(PreTrainedModel):
 class Zeus(ZeusPreTrainedModel):
 
     _supports_flash_attn_2 = True
-    
+
     def __init__(self, config: ZeusConfig):
         super().__init__(config)
         self.config = config
@@ -678,6 +684,10 @@ class ZeusForImputation(Zeus):
             use_norm: bool = True
             ) -> Tuple[torch.Tensor, torch.Tensor]:
 
+        inputs = inputs.to(self.device)
+        targets_mask = targets_mask.to(self.device)
+        targets_mask = targets_mask.to(torch.bool)
+        
         # transform inputs and targets_mask to [B * N, L, 1]
         ndim = inputs.ndim
         num_features = None
@@ -691,7 +701,8 @@ class ZeusForImputation(Zeus):
         elif ndim == 1:
             inputs = inputs.unsqueeze(0).unsqueeze(2)
             targets_mask = targets_mask.unsqueeze(0).unsqueeze(2)
-        
+        L = inputs.shape[1]
+
         if use_norm:
             inputs_mask = ~targets_mask # 1 for valid, 0 for invalid
             valid_count = inputs_mask.sum(dim=1, keepdim=True).clamp_min(1)
@@ -711,10 +722,20 @@ class ZeusForImputation(Zeus):
             quantile_preds = torch.sinh(quantile_preds)
             quantile_preds = quantile_preds * std + mean
 
-        if num_features is not None:
-            quantile_preds = quantile_preds.reshape(-1, num_features, L, self.config.quantiles).transpose(1, 2)
-
         prediction = quantile_preds.mean(dim=-1, keepdim=True)
+
+        if ndim == 2: # [B, L]
+            prediction = prediction.squeeze(-1)
+        elif ndim == 3 and num_features is not None:
+            # [B, L, N]
+            prediction = prediction.reshape(-1, num_features, L).transpose(1, 2)
+            prediction = quantile_preds.reshape(
+                -1, num_features, L, quantile_preds.shape[-1]
+                ).transpose(1, 2) # [B, L, N, Q]
+        elif ndim == 1:
+            prediction = prediction[0, :, 0] #[L,]
+            quantile_preds = quantile_preds[0] # [L, Q]
+
         return prediction, quantile_preds
 
 
